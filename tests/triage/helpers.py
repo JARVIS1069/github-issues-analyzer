@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import zlib
+from types import SimpleNamespace
 
 import httpx
 import numpy as np
@@ -92,6 +93,7 @@ class FakeGitHub:
         self.fail_once: set[str] = set()
         self.issue_comments: dict[int, list[dict]] = {}
         self.labels: dict[int, list[str]] = {}
+        self.repo_labels: list[str] = []
         self.created_issues: list[dict] = []
         self.login = "triage-bot"
         self.user_forbidden = False  # True mimics GitHub App / Actions tokens, which cannot read /user
@@ -139,6 +141,8 @@ class FakeGitHub:
             self.created_issues.append(json.loads(request.content))
             number = 900 + len(self.created_issues)
             return httpx.Response(201, json={"number": number, "html_url": f"https://github.com/{self.repo}/issues/{number}"})
+        if method == "GET" and path == f"{base}/labels":
+            return self._page(request, "labels", [{"name": name} for name in self.repo_labels])
         if method == "GET" and path == f"{base}/issues":
             return self._page(request, "issues", self.issues)
         if method == "GET" and path == f"{base}/issues/comments":
@@ -166,3 +170,20 @@ class FakeGitHub:
             self.labels.setdefault(int(match.group(1)), []).extend(labels)
             return httpx.Response(200, json=[{"name": name} for name in labels])
         return httpx.Response(404, json={"message": "Not Found"})
+
+
+class FakeClient:
+    """Stands in for openai.OpenAI: client.chat.completions.create(...). A reply that is an exception is raised."""
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.calls = []
+        self.usage = None
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=reply))], usage=self.usage)

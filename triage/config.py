@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, get_type_hints
+from typing import Any, get_args, get_type_hints
 
 import yaml
 
@@ -34,11 +34,22 @@ class DigestConfig:
 
 
 @dataclass
+class LabelsConfig:
+    enabled: bool = False
+    apply: bool = False  # add the suggested labels; otherwise they are only shown in a comment
+    max_labels: int = 3
+    neighbors: int = 10  # similar earlier issues whose labels are counted
+    min_share: float = 0.3  # share of the neighbors' similarity a label needs to be suggested
+    similar_threshold: float = 0.85  # similarity at which an earlier issue counts toward priority
+
+
+@dataclass
 class EmbeddingsConfig:
     provider: str = "local"  # local | openai
     model: str = "BAAI/bge-small-en-v1.5"
     base_url: str | None = None
     api_key_env: str | None = None
+    price: float = 0  # USD per 1M tokens
 
 
 @dataclass
@@ -46,16 +57,29 @@ class LLMConfig:
     base_url: str | None = None
     model: str | None = None
     api_key_env: str = "TRIAGE_LLM_KEY"
+    input_price: float = 0  # USD per 1M prompt tokens
+    output_price: float = 0  # USD per 1M completion tokens
+    fallback: LLMConfig | None = None  # used when this model errors or keeps returning invalid JSON
 
     @property
     def enabled(self) -> bool:
         return bool(self.base_url and self.model)
 
 
+TASKS = ("confirm", "ask", "themes", "labels")
+
+
 @dataclass
 class ModelsConfig:
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
-    llm: LLMConfig = field(default_factory=LLMConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)  # default for every task
+    confirm: LLMConfig | None = None  # duplicate confirmation
+    ask: LLMConfig | None = None
+    themes: LLMConfig | None = None  # theme naming in the digest
+    labels: LLMConfig | None = None  # label suggestions
+
+    def llm_for(self, task: str) -> LLMConfig:
+        return getattr(self, task) or self.llm
 
 
 @dataclass
@@ -68,6 +92,7 @@ class Config:
     dry_run: bool = True
     duplicates: DuplicatesConfig = field(default_factory=DuplicatesConfig)
     digest: DigestConfig = field(default_factory=DigestConfig)
+    labels: LabelsConfig = field(default_factory=LabelsConfig)
     exclude_labels: list[str] = field(default_factory=list)
     comments_window_days: int = 180
     models: ModelsConfig = field(default_factory=ModelsConfig)
@@ -86,7 +111,8 @@ def _build(cls: type, data: Any, path: str):
         name = f"{path}.{key}" if path else key
         if key not in known:
             raise ConfigError(f"{name}: unknown setting")
-        kwargs[key] = _build(hints[key], value, name) if is_dataclass(hints[key]) else value
+        kind = next((t for t in (hints[key], *get_args(hints[key])) if is_dataclass(t)), None)
+        kwargs[key] = _build(kind, value, name) if kind and value is not None else value
     return cls(**kwargs)
 
 
@@ -123,6 +149,23 @@ def _validate(cfg: Config) -> None:
             "limits.max_llm_calls_per_run: must be a non-negative integer",
         ),
     ]
+    lab = cfg.labels
+    checks += [
+        (isinstance(lab.enabled, bool) and isinstance(lab.apply, bool), "labels.enabled and labels.apply: must be true or false"),
+        (is_int(lab.max_labels) and 1 <= lab.max_labels <= 10, "labels.max_labels: must be an integer from 1 to 10"),
+        (is_int(lab.neighbors) and 1 <= lab.neighbors <= 100, "labels.neighbors: must be an integer from 1 to 100"),
+        (is_number(lab.min_share) and 0 < lab.min_share <= 1, "labels.min_share: must be a number greater than 0 and at most 1"),
+        (is_number(lab.similar_threshold) and 0 < lab.similar_threshold <= 1, "labels.similar_threshold: must be a number greater than 0 and at most 1"),
+    ]
+    models = cfg.models
+    llms = [(f"models.{t}", c) for t in ("llm", *TASKS) if (c := getattr(models, t))]
+    while llms:
+        name, llm = llms.pop()
+        for price in ("input_price", "output_price"):
+            checks.append((is_number(getattr(llm, price)) and getattr(llm, price) >= 0, f"{name}.{price}: must be a number of at least 0"))
+        if llm.fallback:
+            llms.append((f"{name}.fallback", llm.fallback))
+    checks.append((is_number(models.embeddings.price) and models.embeddings.price >= 0, "models.embeddings.price: must be a number of at least 0"))
     for ok, message in checks:
         if not ok:
             raise ConfigError(message)
